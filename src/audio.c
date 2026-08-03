@@ -12,6 +12,52 @@
 
 #define FFT_SIZE 2048  /* power of 2 */
 
+/* On x86/x86-64, disable hardware denormal handling on this thread.
+ *
+ * The bug this fixes: g_running_peak in fft_bands_log() (fft.c) decays
+ * geometrically towards whatever the current frame's peak is. During a
+ * quiet passage or a hard fade/cut to true digital silence, that decay
+ * runs all the way down through the subnormal float range (< ~1.18e-38)
+ * before settling near zero - and every FMA/mul/add the CPU does on a
+ * subnormal operand runs 10-100x slower than normal (microcode
+ * fallback instead of the fast FPU datapath). That penalty hits the
+ * FFT butterfly math too, since a near-silent window means many of its
+ * intermediate values are subnormal as well. All of this happens
+ * inside data_callback(), on the real-time audio thread, with a hard
+ * per-buffer deadline - so a track with a long quiet intro/outro or
+ * an internal silent gap makes every callback during that stretch
+ * take dramatically longer, which is exactly the "stutter -> slows
+ * down -> eventually freezes" pattern: the longer the quiet section
+ * lasts, the deeper into subnormal territory the decay goes, and the
+ * worse each callback's overrun gets. It's file-dependent (only
+ * tracks with sustained quiet/silent stretches trigger it) and has
+ * nothing to do with bitrate per se - 320kbps rips just happen to be
+ * the ones you have with long clean fades. mpv/ffmpeg isn't affected
+ * because ffmpeg's resampler/filters already run with FTZ/DAZ enabled.
+ *
+ * FTZ (flush-to-zero) makes the CPU round subnormal *results* to 0.0
+ * instead of computing them at full precision; DAZ (denormals-are-zero)
+ * treats subnormal *inputs* as 0.0 before the op. Setting both on this
+ * thread makes every SSE float op here immune to the slowdown, at the
+ * cost of the (perceptually meaningless, for audio) precision below
+ * ~1e-38. This is standard practice in real-time audio engines. */
+#if defined(__SSE__) || defined(__x86_64__) || defined(_M_X64) || defined(_M_IX86)
+#define LDMP_HAS_SSE_FTZ 1
+#include <xmmintrin.h>
+#include <pmmintrin.h>
+#endif
+
+static void disable_denormals_on_this_thread(void) {
+#ifdef LDMP_HAS_SSE_FTZ
+    static _Thread_local bool done = false;
+    if (!done) {
+        _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+        _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+        done = true;
+    }
+#endif
+}
+
 static ma_decoder   g_decoder;
 static ma_device    g_device;
 static bool         g_decoder_loaded = false;
@@ -47,8 +93,40 @@ static float  g_running_peak = 1.0f;
 static float  g_bands[VIS_BANDS];
 static ma_mutex g_bands_mutex;
 
+/* Cached track duration in seconds, computed once in audio_play_file()
+ * instead of being re-queried from the decoder on every UI tick.
+ *
+ * The real bug this works around: miniaudio's MP3 backend
+ * (ma_dr_mp3_get_pcm_frame_count(), in the vendored dr_mp3 inside
+ * miniaudio.h) only returns an O(1) cached frame count when the file's
+ * Xing/VBRI header already told it the exact count up front. When that
+ * header is missing - which some 320kbps rips don't have, apparently -
+ * pMP3->totalPCMFrameCount stays MA_UINT64_MAX for the life of the
+ * decoder (it's set once at init and never written again anywhere in
+ * miniaudio.h), so *every* length query falls back to
+ * ma_dr_mp3_get_mp3_and_pcm_frame_count(), which: seeks to the start
+ * and decodes the ENTIRE compressed stream frame-by-frame just to
+ * count it, then seeks back to wherever playback currently is - and
+ * since there's no seek table yet either, that seek-back is a brute-
+ * force decode from the start of the file up to the current position.
+ * That second part is why it gets *worse* the longer the track plays:
+ * early on the seek-back is cheap, but by the end it's redecoding
+ * almost the whole file, every single call.
+ *
+ * We were calling this (via audio_get_duration_seconds()) from the
+ * main thread on every ~60ms UI tick, while holding g_decoder_mutex -
+ * the same lock the real-time audio callback needs every buffer. So
+ * this wasn't just an audio-thread problem: the main thread was
+ * spending longer and longer doing this scan, holding the lock the
+ * whole time, which blocked the audio callback too - hence the
+ * "entire program" slowing down, not just playback. The duration
+ * never changes once a track is loaded, so there was never a reason
+ * to ask the decoder for it more than once. */
+static double g_duration_seconds = 0.0;
+
 static void data_callback(ma_device *pDevice, void *pOutput, const void *pInput, ma_uint32 frameCount) {
     (void)pInput;
+    disable_denormals_on_this_thread();
     float *out = (float *)pOutput;
     ma_uint32 channels = pDevice->playback.channels;
 
@@ -155,6 +233,15 @@ int audio_play_file(const char *path) {
     g_decoder_loaded = true;
     atomic_store(&g_finished_flag, false);
     atomic_store(&g_state, PLAYER_PLAYING);
+    /* Pay the (possibly expensive, for a no-Xing-header MP3) cost of
+     * asking the decoder for the length exactly once here, while
+     * nothing else needs g_decoder_mutex yet - not on every UI tick.
+     * See the comment on g_duration_seconds above. */
+    {
+        ma_uint64 len = 0;
+        ma_decoder_get_length_in_pcm_frames(&g_decoder, &len);
+        g_duration_seconds = (double)len / (double)g_device.sampleRate;
+    }
     ma_mutex_unlock(&g_decoder_mutex);
 
     ma_mutex_lock(&g_window_mutex);
@@ -185,9 +272,13 @@ void audio_stop(void) {
 void audio_seek_relative(double seconds) {
     ma_mutex_lock(&g_decoder_mutex);
     if (!g_decoder_loaded) { ma_mutex_unlock(&g_decoder_mutex); return; }
-    ma_uint64 cursor = 0, len = 0;
+    ma_uint64 cursor = 0;
     ma_decoder_get_cursor_in_pcm_frames(&g_decoder, &cursor);
-    ma_decoder_get_length_in_pcm_frames(&g_decoder, &len);
+    /* Use the cached duration (see g_duration_seconds above) instead of
+     * ma_decoder_get_length_in_pcm_frames() - same expensive fallback
+     * scan for a no-Xing-header MP3, no reason to pay it again here
+     * when audio_play_file() already computed it for this track. */
+    ma_uint64 len = (ma_uint64)(g_duration_seconds * g_device.sampleRate);
     ma_int64 target = (ma_int64)cursor + (ma_int64)(seconds * g_device.sampleRate);
     if (target < 0) target = 0;
     if (len > 0 && (ma_uint64)target > len) target = (ma_int64)len - 1;
@@ -219,12 +310,12 @@ double audio_get_position_seconds(void) {
 }
 
 double audio_get_duration_seconds(void) {
+    /* Cached at track-load time - see g_duration_seconds above for why
+     * this must never go back to querying the decoder on every call. */
     ma_mutex_lock(&g_decoder_mutex);
-    if (!g_decoder_loaded) { ma_mutex_unlock(&g_decoder_mutex); return 0.0; }
-    ma_uint64 len = 0;
-    ma_decoder_get_length_in_pcm_frames(&g_decoder, &len);
+    double d = g_decoder_loaded ? g_duration_seconds : 0.0;
     ma_mutex_unlock(&g_decoder_mutex);
-    return (double)len / (double)g_device.sampleRate;
+    return d;
 }
 
 bool audio_poll_and_clear_finished(void) {

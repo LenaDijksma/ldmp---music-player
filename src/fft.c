@@ -96,7 +96,19 @@ void fft_bands_log(const float *mag, int mag_len, float sample_rate,
     } else {
         *running_peak = *running_peak * 0.985f + frame_peak * 0.015f;
     }
-    float peak = *running_peak > 1e-6f ? *running_peak : 1.0f;
+    /* Floor it here, not just in the local `peak` below: during a long
+     * quiet/silent stretch this decay would otherwise keep dividing
+     * running_peak by ~1.015 forever, walking it down through the
+     * subnormal float range (< ~1.18e-38) before it ever gets near
+     * true zero. Subnormal float math is 10-100x slower on most CPUs,
+     * and this runs on the real-time audio thread every FFT window -
+     * that's what turns "quiet part of the song" into audible stutter
+     * that gets worse the longer the quiet section lasts. Clamping the
+     * stored value (not just the local copy used for normalizing)
+     * keeps it out of that range for good instead of only masking it
+     * on this call. */
+    if (*running_peak < 1e-6f) *running_peak = 1e-6f;
+    float peak = *running_peak;
     for (int b = 0; b < num_bands; b++) {
         bands[b] = bands[b] / peak;
         if (bands[b] > 1.0f) bands[b] = 1.0f;
