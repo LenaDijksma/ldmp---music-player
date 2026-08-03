@@ -6,6 +6,7 @@
 #include "audio.h"
 #include "library.h"
 #include "playlist.h"
+#include "mpris.h"
 
 #include <ncurses.h>
 #include <locale.h>
@@ -214,6 +215,22 @@ static void play_prev(app_t *app) {
     int prev = (app->current_idx - 1 + app->lib.count) % app->lib.count;
     play_track(app, prev);
 }
+
+/* ---- MPRIS control callbacks: remote widgets/media-keys drive the
+ * same app_t as the keyboard, via mpris_tick()'s pumped D-Bus calls. */
+static void mpris_cb_play(void *ud) {
+    (void)ud;
+    if (audio_get_state() == PLAYER_PAUSED) audio_toggle_pause();
+}
+static void mpris_cb_pause(void *ud) {
+    (void)ud;
+    if (audio_get_state() == PLAYER_PLAYING) audio_toggle_pause();
+}
+static void mpris_cb_play_pause(void *ud) { (void)ud; audio_toggle_pause(); }
+static void mpris_cb_next(void *ud) { play_next((app_t *)ud); }
+static void mpris_cb_prev(void *ud) { play_prev((app_t *)ud); }
+static void mpris_cb_stop(void *ud) { (void)ud; audio_stop(); }
+static void mpris_cb_seek(void *ud, double offset_seconds) { (void)ud; audio_seek_relative(offset_seconds); }
 
 static void fmt_time(double seconds, char *out, int out_len) {
     if (seconds < 0 || isnan(seconds)) seconds = 0;
@@ -737,6 +754,18 @@ int main(int argc, char **argv) {
     refresh_browse(&app);
     snprintf(app.status, sizeof(app.status), "Loaded %d tracks from %s", app.lib.count, folder);
 
+    mpris_callbacks_t mpris_cbs = {
+        .play = mpris_cb_play,
+        .pause = mpris_cb_pause,
+        .play_pause = mpris_cb_play_pause,
+        .next = mpris_cb_next,
+        .previous = mpris_cb_prev,
+        .stop = mpris_cb_stop,
+        .seek_relative = mpris_cb_seek,
+        .userdata = &app,
+    };
+    mpris_init(&mpris_cbs);
+
     WINDOW *win = initscr();
     noecho();
     cbreak();
@@ -758,12 +787,24 @@ int main(int argc, char **argv) {
             if (app.repeat) play_track(&app, app.current_idx);
             else play_next(&app);
         }
+
+        const char *mp_title = NULL, *mp_artist = NULL;
+        double mp_duration = 0;
+        if (app.current_idx >= 0) {
+            track_t *ct = &app.lib.tracks[app.current_idx];
+            mp_title = (ct->has_tags && ct->title[0]) ? ct->title : basename_of(ct->path);
+            mp_artist = (ct->has_tags && ct->artist[0]) ? ct->artist : NULL;
+            mp_duration = audio_get_duration_seconds();
+        }
+        mpris_tick(mp_title, mp_artist, mp_duration, audio_get_state(), audio_get_volume());
+
         draw(win, &app);
         int ch = wgetch(win);
         if (ch != ERR) handle_input(&app, ch, &running);
     }
 
     endwin();
+    mpris_shutdown();
     audio_shutdown();
     return 0;
 }
