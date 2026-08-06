@@ -33,7 +33,8 @@ typedef enum {
     VIEW_BROWSE,          /* browsing folders under root_folder */
     VIEW_SEARCH,          /* flat search results across the whole library */
     VIEW_PLAYLISTS,       /* list of saved playlists (also used as an "add to..." picker) */
-    VIEW_PLAYLIST_TRACKS  /* tracks inside one open playlist */
+    VIEW_PLAYLIST_TRACKS, /* tracks inside one open playlist */
+    VIEW_QUEUE            /* the up-next play queue */
 } view_t;
 
 typedef enum {
@@ -41,6 +42,17 @@ typedef enum {
     TEXT_SEARCH,
     TEXT_PLAYLIST_NAME
 } text_mode_t;
+
+/* What the VIEW_PLAYLISTS "picker" is currently collecting a target
+ * playlist for - set by 'a', consumed on Enter/creating a new one. */
+typedef enum {
+    ADD_NONE,
+    ADD_TRACK,     /* pending_add_path is a single track */
+    ADD_FOLDER,    /* pending_add_path is a folder; add every track under it */
+    ADD_PLAYLIST   /* pending_add_playlist is a whole playlist to merge in */
+} pending_add_kind_t;
+
+#define MAX_QUEUE_TRACKS 512
 
 typedef struct {
     library_t lib;
@@ -63,9 +75,14 @@ typedef struct {
     playlist_t active_playlist;              /* currently open in VIEW_PLAYLIST_TRACKS */
     int playlist_track_idx[MAX_PLAYLIST_TRACKS]; /* lib.tracks index for each active_playlist track, -1 if missing */
 
-    bool pending_add;                 /* 'a' was pressed: VIEW_PLAYLISTS is acting as a picker */
-    char pending_add_path[PATH_MAXLEN];
+    pending_add_kind_t pending_add_kind; /* 'a' was pressed: VIEW_PLAYLISTS is acting as a picker */
+    char pending_add_path[PATH_MAXLEN];  /* valid for ADD_TRACK / ADD_FOLDER */
+    playlist_t pending_add_playlist;     /* valid for ADD_PLAYLIST: snapshot of the source */
     bool confirm_delete;              /* 'd' pressed once on a playlist; asking to confirm */
+
+    char queue[MAX_QUEUE_TRACKS][PATH_MAXLEN];
+    int queue_count;
+    int queue_track_idx[MAX_QUEUE_TRACKS]; /* lib.tracks index per queue entry, -1 if missing */
 
     text_mode_t text_mode;
     char name_input[PLAYLIST_NAME_MAXLEN];
@@ -136,6 +153,40 @@ static void refresh_playlists(app_t *app) {
     app->playlist_count = playlist_list_all(app->playlists, MAX_PLAYLISTS);
 }
 
+/* Resolves every path in the queue to a lib.tracks index (adding it
+ * to the library if needed), same idea as refresh_playlist_track_index. */
+static void refresh_queue_track_index(app_t *app) {
+    for (int i = 0; i < app->queue_count; i++) {
+        app->queue_track_idx[i] = library_find_or_add_track(&app->lib, app->queue[i]);
+    }
+}
+
+/* Appends `path` to the queue. Unlike playlists, the queue allows
+ * duplicates on purpose (queuing the same song twice is fine). */
+static bool queue_append(app_t *app, const char *path) {
+    if (app->queue_count >= MAX_QUEUE_TRACKS) return false;
+    snprintf(app->queue[app->queue_count], sizeof(app->queue[0]), "%s", path);
+    app->queue_count++;
+    return true;
+}
+
+/* Gathers every track in `lib` that lives at or under `folder`.
+ * Folders are scanned recursively at startup, so this is just a path
+ * prefix match against the already-scanned library - no re-scanning
+ * needed to pull in a whole folder's tracks at once. */
+static int collect_folder_tracks(const library_t *lib, const char *folder, char out[][PATH_MAXLEN], int max_out) {
+    int n = 0;
+    size_t flen = strlen(folder);
+    for (int i = 0; i < lib->count && n < max_out; i++) {
+        const char *p = lib->tracks[i].path;
+        if (strncmp(p, folder, flen) == 0 && (p[flen] == '/' || p[flen] == '\0')) {
+            snprintf(out[n], PATH_MAXLEN, "%s", p);
+            n++;
+        }
+    }
+    return n;
+}
+
 static const char *basename_of(const char *path) {
     const char *slash = strrchr(path, '/');
     return slash ? slash + 1 : path;
@@ -180,7 +231,36 @@ static void play_from_playlist(app_t *app, const playlist_t *pl, int pos) {
     play_track(app, li);
 }
 
+/* Plays the queue entry at `idx`, removing it and everything ahead of
+ * it in the queue (skipping ahead), and drops out of "from playlist"
+ * playback since the queue takes over what plays next. */
+static void play_from_queue_at(app_t *app, int idx) {
+    if (idx < 0 || idx >= app->queue_count) return;
+    char path[PATH_MAXLEN];
+    snprintf(path, sizeof(path), "%s", app->queue[idx]);
+
+    int consumed = idx + 1;
+    int remaining = app->queue_count - consumed;
+    if (remaining > 0) {
+        memmove(&app->queue[0], &app->queue[consumed], (size_t)remaining * sizeof(app->queue[0]));
+    }
+    app->queue_count -= consumed;
+    refresh_queue_track_index(app);
+
+    int li = library_find_or_add_track(&app->lib, path);
+    if (li < 0) {
+        snprintf(app->status, sizeof(app->status), "File missing: %s", path);
+        return;
+    }
+    app->playing_from_playlist = false;
+    play_track(app, li);
+}
+
 static void play_next(app_t *app) {
+    if (app->queue_count > 0) {
+        play_from_queue_at(app, 0);
+        return;
+    }
     if (app->playing_from_playlist) {
         int n = app->playing_playlist.track_count;
         if (n == 0) return;
@@ -254,7 +334,7 @@ static void draw_visualizer(WINDOW *win, int y, int x, int width, int height, fl
         int remainder = (int)total_levels % 8;
         if (full_rows > height) { full_rows = height; remainder = 0; }
 
-        int color_pair = (v < 0.4f) ? 2 : (v < 0.72f) ? 3 : 4;
+        int color_pair = 1;
         wattron(win, COLOR_PAIR(color_pair));
         for (int row = 0; row < full_rows; row++) {
             int wy = y + height - 1 - row;
@@ -278,6 +358,7 @@ static int visible_count_for(app_t *app) {
         case VIEW_BROWSE: return app->entries_count;
         case VIEW_PLAYLISTS: return app->playlist_count;
         case VIEW_PLAYLIST_TRACKS: return app->active_playlist.track_count;
+        case VIEW_QUEUE: return app->queue_count;
     }
     return 0;
 }
@@ -309,14 +390,20 @@ static void draw(WINDOW *win, app_t *app) {
             break;
         }
         case VIEW_PLAYLISTS:
-            if (app->pending_add) {
+            if (app->pending_add_kind == ADD_PLAYLIST) {
+                snprintf(breadcrumb, sizeof(breadcrumb), "Merge \"%s\" into which playlist?  (Enter: pick, c: new, Bksp: cancel)", app->pending_add_playlist.name);
+            } else if (app->pending_add_kind != ADD_NONE) {
                 snprintf(breadcrumb, sizeof(breadcrumb), "Add to playlist  (Enter: pick, c: new, Bksp: cancel)");
             } else {
-                snprintf(breadcrumb, sizeof(breadcrumb), "Playlists  (Enter: open, c: new, dd: delete, Bksp: back)");
+                snprintf(breadcrumb, sizeof(breadcrumb), "Playlists  (Enter: open, c: new, a: merge into..., dd: delete, Bksp: back)");
             }
             break;
         case VIEW_PLAYLIST_TRACKS:
-            snprintf(breadcrumb, sizeof(breadcrumb), "Playlist: %s  (Enter: play, d: remove, Bksp: back)", app->active_playlist.name);
+            snprintf(breadcrumb, sizeof(breadcrumb), "Playlist: %s  (Enter: play, d: remove, a: add to playlist, Bksp: back)", app->active_playlist.name);
+            break;
+        case VIEW_QUEUE:
+            snprintf(breadcrumb, sizeof(breadcrumb), "Queue (%d track%s)  (Enter: play, d: remove, Bksp: back)",
+                     app->queue_count, app->queue_count == 1 ? "" : "s");
             break;
     }
     wattron(win, A_DIM);
@@ -373,6 +460,17 @@ static void draw(WINDOW *win, app_t *app) {
                     if (is_current) prefix = "\xE2\x96\xB6 ";
                 } else {
                     snprintf(name, sizeof(name), "%s (missing)", basename_of(app->active_playlist.tracks[fi]));
+                }
+                break;
+            }
+            case VIEW_QUEUE: {
+                int li = app->queue_track_idx[fi];
+                if (li >= 0) {
+                    library_display_name(&app->lib.tracks[li], name, sizeof(name));
+                    is_current = (li == app->current_idx) && audio_get_state() != PLAYER_STOPPED;
+                    if (is_current) prefix = "\xE2\x96\xB6 ";
+                } else {
+                    snprintf(name, sizeof(name), "%s (missing)", basename_of(app->queue[fi]));
                 }
                 break;
             }
@@ -473,7 +571,7 @@ static void draw(WINDOW *win, app_t *app) {
     } else {
         mvwaddstr(win, help_y, 1,
             "\xE2\x86\x91/\xE2\x86\x93 nav  Enter open/play  Bksp back  Space pause  n/p next/prev  "
-            "r repeat  x shuffle  a add-to-playlist  v playlists  / search  q quit");
+            "r repeat  x shuffle  a add-to-playlist  z add-to-queue  v playlists  Q queue  / search  q quit");
     }
     wattroff(win, A_DIM);
 
@@ -499,13 +597,40 @@ static void handle_input(app_t *app, int ch, bool *running) {
                 app->name_input_len = 0;
                 app->name_input[0] = '\0';
 
-                if (created && app->pending_add) {
-                    playlist_add_track(&newpl, app->pending_add_path);
-                    snprintf(app->status, sizeof(app->status), "Added to new playlist \"%s\"", newpl.name);
-                    app->pending_add = false;
-                    app->view = app->view_before_playlists;
-                    app->cursor = app->saved_cursor;
-                    app->scroll = app->saved_scroll;
+                if (created && app->pending_add_kind != ADD_NONE) {
+                    pending_add_kind_t kind = app->pending_add_kind;
+                    switch (kind) {
+                        case ADD_TRACK:
+                            playlist_add_track(&newpl, app->pending_add_path);
+                            snprintf(app->status, sizeof(app->status), "Added to new playlist \"%s\"", newpl.name);
+                            break;
+                        case ADD_FOLDER: {
+                            static char paths[MAX_PLAYLIST_TRACKS][PATH_MAXLEN];
+                            int n = collect_folder_tracks(&app->lib, app->pending_add_path, paths, MAX_PLAYLIST_TRACKS);
+                            int added = playlist_add_paths(&newpl, paths, n);
+                            snprintf(app->status, sizeof(app->status), "Added %d track%s to new playlist \"%s\"",
+                                     added, added == 1 ? "" : "s", newpl.name);
+                            break;
+                        }
+                        case ADD_PLAYLIST: {
+                            int added = playlist_merge(&newpl, &app->pending_add_playlist);
+                            snprintf(app->status, sizeof(app->status), "Merged %d track%s into new playlist \"%s\"",
+                                     added, added == 1 ? "" : "s", newpl.name);
+                            break;
+                        }
+                        default: break;
+                    }
+                    app->pending_add_kind = ADD_NONE;
+                    if (kind == ADD_PLAYLIST) {
+                        refresh_playlists(app);
+                        app->view = VIEW_PLAYLISTS;
+                        app->cursor = 0;
+                        app->scroll = 0;
+                    } else {
+                        app->view = app->view_before_playlists;
+                        app->cursor = app->saved_cursor;
+                        app->scroll = app->saved_scroll;
+                    }
                 } else if (created) {
                     snprintf(app->status, sizeof(app->status), "Created playlist \"%s\"", newpl.name);
                     app->view = VIEW_PLAYLISTS;
@@ -556,7 +681,7 @@ static void handle_input(app_t *app, int ch, bool *running) {
     if (ch != 'd') app->confirm_delete = false;
 
     switch (ch) {
-        case 'q': case 'Q': *running = false; break;
+        case 'q': *running = false; break;
         case '/':
             app->text_mode = TEXT_SEARCH;
             app->search_len = 0;
@@ -587,13 +712,43 @@ static void handle_input(app_t *app, int ch, bool *running) {
                 case VIEW_PLAYLISTS:
                     if (app->playlist_count > 0) {
                         playlist_t *p = &app->playlists[app->cursor];
-                        if (app->pending_add) {
+                        if (app->pending_add_kind == ADD_PLAYLIST) {
+                            if (strcmp(p->file_path, app->pending_add_playlist.file_path) == 0) {
+                                snprintf(app->status, sizeof(app->status), "Pick a different playlist to merge into");
+                                break;
+                            }
+                            int added = playlist_merge(p, &app->pending_add_playlist);
+                            if (added >= 0) {
+                                snprintf(app->status, sizeof(app->status), "Merged %d new track%s into \"%s\"",
+                                         added, added == 1 ? "" : "s", p->name);
+                            } else {
+                                snprintf(app->status, sizeof(app->status), "Failed to save \"%s\"", p->name);
+                            }
+                            app->pending_add_kind = ADD_NONE;
+                            refresh_playlists(app);
+                            app->cursor = 0;
+                            app->scroll = 0;
+                        } else if (app->pending_add_kind == ADD_FOLDER) {
+                            static char paths[MAX_PLAYLIST_TRACKS][PATH_MAXLEN];
+                            int n = collect_folder_tracks(&app->lib, app->pending_add_path, paths, MAX_PLAYLIST_TRACKS);
+                            int added = playlist_add_paths(p, paths, n);
+                            if (added >= 0) {
+                                snprintf(app->status, sizeof(app->status), "Added %d new track%s to \"%s\"",
+                                         added, added == 1 ? "" : "s", p->name);
+                            } else {
+                                snprintf(app->status, sizeof(app->status), "Failed to save \"%s\"", p->name);
+                            }
+                            app->pending_add_kind = ADD_NONE;
+                            app->view = app->view_before_playlists;
+                            app->cursor = app->saved_cursor;
+                            app->scroll = app->saved_scroll;
+                        } else if (app->pending_add_kind == ADD_TRACK) {
                             if (playlist_add_track(p, app->pending_add_path)) {
                                 snprintf(app->status, sizeof(app->status), "Added to \"%s\"", p->name);
                             } else {
                                 snprintf(app->status, sizeof(app->status), "\"%s\" is full", p->name);
                             }
-                            app->pending_add = false;
+                            app->pending_add_kind = ADD_NONE;
                             app->view = app->view_before_playlists;
                             app->cursor = app->saved_cursor;
                             app->scroll = app->saved_scroll;
@@ -611,6 +766,9 @@ static void handle_input(app_t *app, int ch, bool *running) {
                         play_from_playlist(app, &app->active_playlist, app->cursor);
                     }
                     break;
+                case VIEW_QUEUE:
+                    if (app->queue_count > 0) play_from_queue_at(app, app->cursor);
+                    break;
             }
             break;
         case KEY_BACKSPACE: case 127: case 8:
@@ -618,10 +776,18 @@ static void handle_input(app_t *app, int ch, bool *running) {
                 case VIEW_BROWSE: go_up_folder(app); break;
                 case VIEW_SEARCH: break;
                 case VIEW_PLAYLISTS:
-                    app->pending_add = false;
-                    app->view = app->view_before_playlists;
-                    app->cursor = app->saved_cursor;
-                    app->scroll = app->saved_scroll;
+                    if (app->pending_add_kind == ADD_PLAYLIST) {
+                        /* cancel an in-place merge picker; stay in VIEW_PLAYLISTS */
+                        app->pending_add_kind = ADD_NONE;
+                        refresh_playlists(app);
+                        app->cursor = 0;
+                        app->scroll = 0;
+                    } else {
+                        app->pending_add_kind = ADD_NONE;
+                        app->view = app->view_before_playlists;
+                        app->cursor = app->saved_cursor;
+                        app->scroll = app->saved_scroll;
+                    }
                     break;
                 case VIEW_PLAYLIST_TRACKS:
                     refresh_playlists(app);
@@ -629,45 +795,136 @@ static void handle_input(app_t *app, int ch, bool *running) {
                     app->cursor = 0;
                     app->scroll = 0;
                     break;
+                case VIEW_QUEUE:
+                    app->view = app->view_before_playlists;
+                    app->cursor = app->saved_cursor;
+                    app->scroll = app->saved_scroll;
+                    break;
             }
             break;
         case 'v':
             if (app->view == VIEW_PLAYLISTS || app->view == VIEW_PLAYLIST_TRACKS) {
-                app->pending_add = false;
+                app->pending_add_kind = ADD_NONE;
                 app->view = app->view_before_playlists;
                 app->cursor = app->saved_cursor;
                 app->scroll = app->saved_scroll;
-            } else {
+            } else if (app->view != VIEW_QUEUE) {
                 app->view_before_playlists = app->view;
                 app->saved_cursor = app->cursor;
                 app->saved_scroll = app->scroll;
-                app->pending_add = false;
+                app->pending_add_kind = ADD_NONE;
                 refresh_playlists(app);
                 app->view = VIEW_PLAYLISTS;
+                app->cursor = 0;
+                app->scroll = 0;
+            }
+            break;
+        case 'Q':
+            if (app->view == VIEW_QUEUE) {
+                app->view = app->view_before_playlists;
+                app->cursor = app->saved_cursor;
+                app->scroll = app->saved_scroll;
+            } else if (app->view != VIEW_PLAYLISTS && app->view != VIEW_PLAYLIST_TRACKS) {
+                app->view_before_playlists = app->view;
+                app->saved_cursor = app->cursor;
+                app->saved_scroll = app->scroll;
+                refresh_queue_track_index(app);
+                app->view = VIEW_QUEUE;
                 app->cursor = 0;
                 app->scroll = 0;
             }
             break;
         case 'a': {
+            if (app->pending_add_kind != ADD_NONE) break; /* already picking a target */
+
+            if (app->view == VIEW_PLAYLISTS && app->playlist_count > 0) {
+                /* merge this whole playlist into another one */
+                app->pending_add_kind = ADD_PLAYLIST;
+                app->pending_add_playlist = app->playlists[app->cursor];
+                app->cursor = 0;
+                app->scroll = 0;
+                snprintf(app->status, sizeof(app->status), "Merge \"%s\" into which playlist?", app->pending_add_playlist.name);
+                break;
+            }
+
             const char *path = NULL;
-            if (app->view == VIEW_BROWSE && app->entries_count > 0 && app->entries[app->cursor].type == BROWSE_TRACK) {
-                path = app->lib.tracks[app->entries[app->cursor].track_idx].path;
+            const char *folder = NULL;
+            if (app->view == VIEW_BROWSE && app->entries_count > 0) {
+                browse_entry_t *e = &app->entries[app->cursor];
+                if (e->type == BROWSE_TRACK) path = app->lib.tracks[e->track_idx].path;
+                else folder = e->path;
+            } else if (app->view == VIEW_SEARCH && app->filtered_count > 0) {
+                path = app->lib.tracks[app->filtered[app->cursor]].path;
+            } else if (app->view == VIEW_PLAYLIST_TRACKS && app->active_playlist.track_count > 0) {
+                path = app->active_playlist.tracks[app->cursor];
+            } else if (app->view == VIEW_QUEUE && app->queue_count > 0) {
+                path = app->queue[app->cursor];
+            }
+
+            if (path) {
+                app->pending_add_kind = ADD_TRACK;
+                snprintf(app->pending_add_path, sizeof(app->pending_add_path), "%s", path);
+            } else if (folder) {
+                app->pending_add_kind = ADD_FOLDER;
+                snprintf(app->pending_add_path, sizeof(app->pending_add_path), "%s", folder);
+            } else {
+                break;
+            }
+
+            app->view_before_playlists = app->view;
+            app->saved_cursor = app->cursor;
+            app->saved_scroll = app->scroll;
+            refresh_playlists(app);
+            app->view = VIEW_PLAYLISTS;
+            app->cursor = 0;
+            app->scroll = 0;
+            snprintf(app->status, sizeof(app->status), folder ? "Add folder to which playlist?" : "Add to which playlist?");
+            break;
+        }
+        case 'z': {
+            if (app->view == VIEW_PLAYLISTS && app->playlist_count > 0) {
+                playlist_t *p = &app->playlists[app->cursor];
+                int added = 0;
+                for (int i = 0; i < p->track_count && app->queue_count < MAX_QUEUE_TRACKS; i++) {
+                    if (queue_append(app, p->tracks[i])) added++;
+                }
+                refresh_queue_track_index(app);
+                snprintf(app->status, sizeof(app->status), "Queued %d track%s from \"%s\"", added, added == 1 ? "" : "s", p->name);
+                break;
+            }
+            if (app->view == VIEW_QUEUE) {
+                snprintf(app->status, sizeof(app->status), "Already in the queue");
+                break;
+            }
+
+            const char *path = NULL;
+            const char *folder = NULL;
+            if (app->view == VIEW_BROWSE && app->entries_count > 0) {
+                browse_entry_t *e = &app->entries[app->cursor];
+                if (e->type == BROWSE_TRACK) path = app->lib.tracks[e->track_idx].path;
+                else folder = e->path;
             } else if (app->view == VIEW_SEARCH && app->filtered_count > 0) {
                 path = app->lib.tracks[app->filtered[app->cursor]].path;
             } else if (app->view == VIEW_PLAYLIST_TRACKS && app->active_playlist.track_count > 0) {
                 path = app->active_playlist.tracks[app->cursor];
             }
+
             if (path) {
-                snprintf(app->pending_add_path, sizeof(app->pending_add_path), "%s", path);
-                app->pending_add = true;
-                app->view_before_playlists = app->view;
-                app->saved_cursor = app->cursor;
-                app->saved_scroll = app->scroll;
-                refresh_playlists(app);
-                app->view = VIEW_PLAYLISTS;
-                app->cursor = 0;
-                app->scroll = 0;
-                snprintf(app->status, sizeof(app->status), "Add to which playlist?");
+                if (queue_append(app, path)) {
+                    refresh_queue_track_index(app);
+                    snprintf(app->status, sizeof(app->status), "Added to queue");
+                } else {
+                    snprintf(app->status, sizeof(app->status), "Queue is full");
+                }
+            } else if (folder) {
+                static char paths[MAX_QUEUE_TRACKS][PATH_MAXLEN];
+                int n = collect_folder_tracks(&app->lib, folder, paths, MAX_QUEUE_TRACKS);
+                int added = 0;
+                for (int i = 0; i < n && app->queue_count < MAX_QUEUE_TRACKS; i++) {
+                    if (queue_append(app, paths[i])) added++;
+                }
+                refresh_queue_track_index(app);
+                snprintf(app->status, sizeof(app->status), "Queued %d track%s", added, added == 1 ? "" : "s");
             }
             break;
         }
@@ -697,6 +954,18 @@ static void handle_input(app_t *app, int ch, bool *running) {
                     app->cursor = app->active_playlist.track_count > 0 ? app->active_playlist.track_count - 1 : 0;
                 }
                 snprintf(app->status, sizeof(app->status), "Removed from playlist");
+            } else if (app->view == VIEW_QUEUE && app->queue_count > 0) {
+                int idx = app->cursor;
+                int remaining = app->queue_count - idx - 1;
+                if (remaining > 0) {
+                    memmove(&app->queue[idx], &app->queue[idx + 1], (size_t)remaining * sizeof(app->queue[0]));
+                    memmove(&app->queue_track_idx[idx], &app->queue_track_idx[idx + 1], (size_t)remaining * sizeof(app->queue_track_idx[0]));
+                }
+                app->queue_count--;
+                if (app->cursor >= app->queue_count) {
+                    app->cursor = app->queue_count > 0 ? app->queue_count - 1 : 0;
+                }
+                snprintf(app->status, sizeof(app->status), "Removed from queue");
             }
             break;
         case ' ': audio_toggle_pause(); break;

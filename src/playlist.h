@@ -51,6 +51,18 @@ bool playlist_add_track(playlist_t *pl, const char *track_path);
 /* Removes the track at `index` from `pl` and saves. */
 bool playlist_remove_track(playlist_t *pl, int index);
 
+/* Adds every path in `paths` (an array of `count` PATH_MAXLEN buffers,
+ * e.g. gathered from a whole folder) to `pl`, skipping any already
+ * present, then saves once. Returns the number of NEW tracks added
+ * (may be less than `count` due to duplicates or a full playlist). */
+int playlist_add_paths(playlist_t *pl, char paths[][PATH_MAXLEN], int count);
+
+/* Adds every track in `src` to `dest` that isn't already there (so
+ * merging a playlist into another is duplicate-free and idempotent),
+ * then saves once. `dest` and `src` may not be the same playlist.
+ * Returns the number of NEW tracks added. */
+int playlist_merge(playlist_t *dest, const playlist_t *src);
+
 /* Deletes `pl`'s backing .json file from disk. Does not touch the
  * audio files it referenced. */
 bool playlist_delete(const playlist_t *pl);

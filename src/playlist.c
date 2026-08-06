@@ -128,6 +128,40 @@ bool playlist_delete(const playlist_t *pl) {
     return remove(pl->file_path) == 0;
 }
 
+static bool playlist_has_track(const playlist_t *pl, const char *track_path) {
+    for (int i = 0; i < pl->track_count; i++) {
+        if (strcmp(pl->tracks[i], track_path) == 0) return true;
+    }
+    return false;
+}
+
+int playlist_add_paths(playlist_t *pl, char paths[][PATH_MAXLEN], int count) {
+    int added = 0;
+    for (int i = 0; i < count; i++) {
+        if (pl->track_count >= MAX_PLAYLIST_TRACKS) break;
+        if (playlist_has_track(pl, paths[i])) continue;
+        snprintf(pl->tracks[pl->track_count], sizeof(pl->tracks[0]), "%s", paths[i]);
+        pl->track_count++;
+        added++;
+    }
+    if (added > 0 && !playlist_save(pl)) return -1;
+    return added;
+}
+
+int playlist_merge(playlist_t *dest, const playlist_t *src) {
+    if (dest == src || strcmp(dest->file_path, src->file_path) == 0) return 0;
+    int added = 0;
+    for (int i = 0; i < src->track_count; i++) {
+        if (dest->track_count >= MAX_PLAYLIST_TRACKS) break;
+        if (playlist_has_track(dest, src->tracks[i])) continue;
+        snprintf(dest->tracks[dest->track_count], sizeof(dest->tracks[0]), "%s", src->tracks[i]);
+        dest->track_count++;
+        added++;
+    }
+    if (added > 0 && !playlist_save(dest)) return -1;
+    return added;
+}
+
 /* Reads the whole file into a malloc'd, NUL-terminated buffer. Caller
  * frees. Returns NULL on error. */
 static char *read_whole_file(const char *path) {
