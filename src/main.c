@@ -58,7 +58,8 @@ typedef struct {
     library_t lib;
 
     view_t view;
-    view_t view_before_playlists; /* where to return to when leaving playlist views */
+    view_t view_before_playlists; /* where to return to when leaving the playlists panel / picker */
+    view_t view_before_queue;     /* where to return to when leaving the queue panel */
 
     int filtered[MAX_TRACKS];
     int filtered_count;
@@ -90,8 +91,10 @@ typedef struct {
 
     int cursor;
     int scroll;
-    int saved_cursor;   /* browse/search cursor+scroll to restore when leaving playlist views */
+    int saved_cursor;   /* browse/search cursor+scroll to restore when leaving the playlists panel */
     int saved_scroll;
+    int saved_cursor_queue; /* cursor+scroll to restore when leaving the queue panel */
+    int saved_scroll_queue;
 
     int current_idx;      /* index into lib.tracks, -1 if none */
     bool playing_from_playlist;    /* true: n/p/auto-advance stay within playing_playlist */
@@ -796,9 +799,9 @@ static void handle_input(app_t *app, int ch, bool *running) {
                     app->scroll = 0;
                     break;
                 case VIEW_QUEUE:
-                    app->view = app->view_before_playlists;
-                    app->cursor = app->saved_cursor;
-                    app->scroll = app->saved_scroll;
+                    app->view = app->view_before_queue;
+                    app->cursor = app->saved_cursor_queue;
+                    app->scroll = app->saved_scroll_queue;
                     break;
             }
             break;
@@ -808,7 +811,7 @@ static void handle_input(app_t *app, int ch, bool *running) {
                 app->view = app->view_before_playlists;
                 app->cursor = app->saved_cursor;
                 app->scroll = app->saved_scroll;
-            } else if (app->view != VIEW_QUEUE) {
+            } else {
                 app->view_before_playlists = app->view;
                 app->saved_cursor = app->cursor;
                 app->saved_scroll = app->scroll;
@@ -820,14 +823,15 @@ static void handle_input(app_t *app, int ch, bool *running) {
             }
             break;
         case 'Q':
+            if (app->pending_add_kind != ADD_NONE) break; /* don't leave mid-pick */
             if (app->view == VIEW_QUEUE) {
-                app->view = app->view_before_playlists;
-                app->cursor = app->saved_cursor;
-                app->scroll = app->saved_scroll;
-            } else if (app->view != VIEW_PLAYLISTS && app->view != VIEW_PLAYLIST_TRACKS) {
-                app->view_before_playlists = app->view;
-                app->saved_cursor = app->cursor;
-                app->saved_scroll = app->scroll;
+                app->view = app->view_before_queue;
+                app->cursor = app->saved_cursor_queue;
+                app->scroll = app->saved_scroll_queue;
+            } else {
+                app->view_before_queue = app->view;
+                app->saved_cursor_queue = app->cursor;
+                app->saved_scroll_queue = app->scroll;
                 refresh_queue_track_index(app);
                 app->view = VIEW_QUEUE;
                 app->cursor = 0;
