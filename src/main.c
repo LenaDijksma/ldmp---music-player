@@ -314,6 +314,17 @@ static void mpris_cb_next(void *ud) { play_next((app_t *)ud); }
 static void mpris_cb_prev(void *ud) { play_prev((app_t *)ud); }
 static void mpris_cb_stop(void *ud) { (void)ud; audio_stop(); }
 static void mpris_cb_seek(void *ud, double offset_seconds) { (void)ud; audio_seek_relative(offset_seconds); }
+static void mpris_cb_set_shuffle(void *ud, bool on) {
+    app_t *app = (app_t *)ud;
+    app->shuffle = on;
+    snprintf(app->status, sizeof(app->status), "Shuffle: %s", on ? "on" : "off");
+}
+static void mpris_cb_set_repeat(void *ud, bool on) {
+    app_t *app = (app_t *)ud;
+    app->repeat = on;
+    snprintf(app->status, sizeof(app->status), "Repeat: %s", on ? "on" : "off");
+}
+static void mpris_cb_set_volume(void *ud, double volume) { (void)ud; audio_set_volume((float)volume); }
 
 static void fmt_time(double seconds, char *out, int out_len) {
     if (seconds < 0 || isnan(seconds)) seconds = 0;
@@ -1035,6 +1046,9 @@ int main(int argc, char **argv) {
         .previous = mpris_cb_prev,
         .stop = mpris_cb_stop,
         .seek_relative = mpris_cb_seek,
+        .set_shuffle = mpris_cb_set_shuffle,
+        .set_repeat = mpris_cb_set_repeat,
+        .set_volume = mpris_cb_set_volume,
         .userdata = &app,
     };
     mpris_init(&mpris_cbs);
@@ -1061,15 +1075,20 @@ int main(int argc, char **argv) {
             else play_next(&app);
         }
 
-        const char *mp_title = NULL, *mp_artist = NULL;
-        double mp_duration = 0;
+        mpris_state_t mp = {
+            .state = audio_get_state(),
+            .volume = audio_get_volume(),
+            .shuffle = app.shuffle,
+            .repeat = app.repeat,
+        };
         if (app.current_idx >= 0) {
             track_t *ct = &app.lib.tracks[app.current_idx];
-            mp_title = (ct->has_tags && ct->title[0]) ? ct->title : basename_of(ct->path);
-            mp_artist = (ct->has_tags && ct->artist[0]) ? ct->artist : NULL;
-            mp_duration = audio_get_duration_seconds();
+            mp.title = (ct->has_tags && ct->title[0]) ? ct->title : basename_of(ct->path);
+            mp.artist = (ct->has_tags && ct->artist[0]) ? ct->artist : NULL;
+            mp.path = ct->path;
+            mp.duration_seconds = audio_get_duration_seconds();
         }
-        mpris_tick(mp_title, mp_artist, mp_duration, audio_get_state(), audio_get_volume());
+        mpris_tick(&mp);
 
         draw(win, &app);
         int ch = wgetch(win);

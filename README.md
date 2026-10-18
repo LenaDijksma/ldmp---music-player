@@ -107,6 +107,30 @@ Once you play a track from inside a playlist, `n`/`p` (and shuffle/
 repeat) stay scoped to that playlist's tracks instead of the whole
 library, until you play something from browsing or search instead.
 
+## MPRIS (desktop widgets, media keys, playerctl)
+
+If `libdbus-1-dev` is installed at build time, ldmp registers as `org.mpris.MediaPlayer2.ldmp` on the session bus.
+Besides play/pause/next/previous/seek it exports:
+
+- **Cover art** (`mpris:artUrl`) and the file location (`xesam:url`). The picture is taken from the file itself
+  (MP3 ID3v2.3/2.4 APIC, FLAC PICTURE; saved once to `~/.cache/ldmp/covers/`, identical art is stored only once),
+  otherwise from a `cover` / `folder` / `front` / `album` / `albumart` image (`.jpg .jpeg .png .webp`) in the track's folder.
+- **Shuffle** (read/write) and **LoopStatus** (read/write). ldmp has no "stop after the last track" mode, so it reports
+  `Playlist` normally and `Track` while repeat (`r`) is on; setting `Track` turns repeat on, anything else turns it off.
+- **Volume** (read/write), announced whenever it changes.
+
+```bash
+playerctl -p ldmp shuffle toggle
+playerctl -p ldmp loop Track
+playerctl -p ldmp metadata mpris:artUrl
+```
+
+## If ldmp crashes
+
+`make debug`, then `ASAN_OPTIONS=log_path=/tmp/ldmp-asan ./ldmp-debug ~/Music`, reproduce the crash and read `/tmp/ldmp-asan.*`
+(it names the file and line). To narrow it down without a debugger, `LDMP_NO_COVER=1 ldmp` turns cover-art lookup off and
+`LDMP_NO_MPRIS=1 ldmp` turns the D-Bus interface off.
+
 ## Project layout
 
 ```
@@ -114,6 +138,8 @@ src/
   main.c            ncurses UI, input handling, playlist logic
   audio.c/.h         miniaudio wrapper: play/pause/seek/volume + spectrum extraction
   fft.c/.h            radix-2 FFT + log-band bucketing (cava-style auto-gain)
+  mpris.c/.h          MPRIS2 D-Bus interface (optional, needs libdbus-1-dev)
+  cover.c/.h          cover art: embedded (ID3 APIC / FLAC PICTURE) or an image next to the file
   library.c/.h        recursive folder scan, folder-browse listing, minimal ID3v2 tag reader
   playlist.c/.h       JSON playlists (reference tracks by path, never copy audio)
   miniaudio.h          vendored single-header playback/decode library

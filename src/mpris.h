@@ -2,6 +2,7 @@
 #define LDMP_MPRIS_H
 
 #include "audio.h"
+#include <stdbool.h>
 
 /* Callbacks the MPRIS layer invokes when a remote controller (desktop
  * widget, waybar/eww/ags module, playerctl, media keys, etc.) sends a
@@ -18,6 +19,10 @@ typedef struct {
      * MPRIS Seek() call and SetPosition() (translated to a relative
      * offset from the current position). */
     void (*seek_relative)(void *userdata, double offset_seconds);
+    /* Writable properties: a controller (LovelyRice, playerctl shuffle/loop, ...) set them. */
+    void (*set_shuffle)(void *userdata, bool on);
+    void (*set_repeat)(void *userdata, bool on);   /* ldmp's repeat = repeat the current track */
+    void (*set_volume)(void *userdata, double volume);   /* 0.0 - 1.0 */
     void *userdata;
 } mpris_callbacks_t;
 
@@ -30,13 +35,25 @@ typedef struct {
 int mpris_init(const mpris_callbacks_t *callbacks);
 void mpris_shutdown(void);
 
+/* What ldmp tells MPRIS each tick. `title`, `artist` and `path` may be NULL
+ * when nothing is loaded; `path` is the absolute file path of the current
+ * track (exported as xesam:url, and used to find cover art for mpris:artUrl). */
+typedef struct {
+    const char *title;
+    const char *artist;
+    const char *path;
+    double duration_seconds;
+    player_state_t state;
+    float volume;
+    bool shuffle;
+    bool repeat;
+} mpris_state_t;
+
 /* Call once per main-loop tick with the current playback state.
  * Pumps the D-Bus connection (services incoming method calls) and
- * emits PropertiesChanged signals whenever the track or playback
- * status actually changed since the previous call. Cheap to call
- * even when nothing changed. `title`/`artist` may be NULL when
- * nothing is loaded. */
-void mpris_tick(const char *title, const char *artist,
-                 double duration_seconds, player_state_t state, float volume);
+ * emits PropertiesChanged signals whenever the track, playback status,
+ * volume, shuffle or repeat actually changed since the previous call.
+ * Cheap to call even when nothing changed. */
+void mpris_tick(const mpris_state_t *state);
 
 #endif

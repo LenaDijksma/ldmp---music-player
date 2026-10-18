@@ -15,10 +15,13 @@
  * as it did before this file existed. */
 
 #include "mpris.h"
+#include "cover.h"
 
 #ifdef LDMP_MPRIS
 
 #include <dbus/dbus.h>
+#include <math.h>
+#include <stdlib.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -40,8 +43,52 @@ static char cur_artist[256] = "";
 static double cur_duration  = 0;
 static player_state_t cur_state = PLAYER_STOPPED;
 static float cur_volume = -1.0f;
+static float sent_volume = -1.0f;      /* the volume last announced in a PropertiesChanged */
+static bool cur_shuffle = false;
+static bool cur_repeat  = false;
+static char cur_path[1024] = "";
+static char cur_url[4096] = "";        /* xesam:url */
+static char cur_art_url[4096] = "";    /* mpris:artUrl, empty when the track has no cover */
 static long track_serial = 0;
 static char cur_trackid[64] = "/org/ldmp/track/0";
+
+/* D-Bus strings must be valid UTF-8, and libdbus ABORTS THE WHOLE PROCESS if one isn't (old MP3s with
+ * Latin-1 tags, or file names that aren't UTF-8, are common). So everything text that comes from tags or
+ * paths goes through this first: valid UTF-8 is copied as is, any other byte is taken as Latin-1
+ * ("Caf\xe9" becomes "Café"). Output is always valid UTF-8 and NUL-terminated. */
+static void to_valid_utf8(const char *in, char *out, size_t cap) {
+    size_t w = 0;
+    const unsigned char *p = (const unsigned char *)in;
+    while (*p && w + 4 < cap) {
+        unsigned c = *p;
+        int n = 0;                              /* continuation bytes expected */
+        unsigned cp = 0;
+        if (c < 0x80) { out[w++] = (char)c; p++; continue; }
+        if (c >= 0xC2 && c <= 0xDF) { n = 1; cp = c & 0x1F; }
+        else if (c >= 0xE0 && c <= 0xEF) { n = 2; cp = c & 0x0F; }
+        else if (c >= 0xF0 && c <= 0xF4) { n = 3; cp = c & 0x07; }
+        bool ok = n > 0;
+        for (int i = 1; ok && i <= n; i++) {
+            if ((p[i] & 0xC0) != 0x80) ok = false;
+            else cp = (cp << 6) | (p[i] & 0x3F);
+        }
+        if (ok) {
+            if ((n == 2 && cp < 0x800) || (n == 3 && cp < 0x10000) ||   /* overlong */
+                (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF) ok = false;
+        }
+        if (ok) { for (int i = 0; i <= n; i++) out[w++] = (char)p[i]; p += n + 1; }
+        else {                                  /* Latin-1 fallback for this byte */
+            out[w++] = (char)(0xC0 | (c >> 6));
+            out[w++] = (char)(0x80 | (c & 0x3F));
+            p++;
+        }
+    }
+    out[w] = '\0';
+}
+
+/* ldmp has no "stop at the end" mode: without repeat it moves on to the next track and wraps
+ * around, which is MPRIS's "Playlist". With repeat on it replays the current track: "Track". */
+static const char *loop_str(bool repeat) { return repeat ? "Track" : "Playlist"; }
 
 static const char *status_str(player_state_t s) {
     switch (s) {
@@ -142,6 +189,10 @@ static void append_metadata_variant(DBusMessageIter *iter) {
         append_dict_sv_string(&dict, "xesam:title", cur_title);
     if (cur_artist[0])
         append_dict_sv_string_array1(&dict, "xesam:artist", cur_artist);
+    if (cur_url[0])
+        append_dict_sv_string(&dict, "xesam:url", cur_url);
+    if (cur_art_url[0])
+        append_dict_sv_string(&dict, "mpris:artUrl", cur_art_url);
     dbus_message_iter_close_container(&var, &dict);
     dbus_message_iter_close_container(iter, &var);
 }
@@ -160,6 +211,8 @@ static void append_player_props(DBusMessageIter *dict) {
     append_dict_sv_double(dict, "Volume", cur_volume < 0 ? 1.0 : (double)cur_volume);
     append_dict_sv_int64(dict, "Position", (dbus_int64_t)(audio_get_position_seconds() * 1000000.0));
     append_metadata_prop(dict);
+    append_dict_sv_bool(dict, "Shuffle", cur_shuffle ? TRUE : FALSE);
+    append_dict_sv_string(dict, "LoopStatus", loop_str(cur_repeat));
     append_dict_sv_bool(dict, "CanGoNext", TRUE);
     append_dict_sv_bool(dict, "CanGoPrevious", TRUE);
     append_dict_sv_bool(dict, "CanPlay", TRUE);
@@ -214,6 +267,8 @@ static void handle_get(DBusMessage *msg) {
         else if (!strcmp(prop, "Position"))       append_variant_int64(&iter, (dbus_int64_t)(audio_get_position_seconds() * 1000000.0));
         else if (!strcmp(prop, "Rate") || !strcmp(prop, "MinimumRate") || !strcmp(prop, "MaximumRate"))
             append_variant_double(&iter, 1.0);
+        else if (!strcmp(prop, "Shuffle"))        append_variant_bool(&iter, cur_shuffle ? TRUE : FALSE);
+        else if (!strcmp(prop, "LoopStatus"))     append_variant_string(&iter, loop_str(cur_repeat));
         else if (!strncmp(prop, "Can", 3))        append_variant_bool(&iter, TRUE);
         else ok = false;
     } else if (!strcmp(iface_name, IFACE_ROOT)) {
@@ -250,10 +305,38 @@ static void handle_get_all(DBusMessage *msg) {
     dbus_message_unref(reply);
 }
 
-/* Volume/Rate "Set" isn't wired to anything (ldmp's own +/- keys
- * already drive volume); just ack so well-behaved clients don't hang
- * waiting for a reply. */
-static void handle_set(DBusMessage *msg) { reply_empty(msg); }
+/* Properties.Set(interface, property, value). Shuffle, LoopStatus and Volume drive ldmp;
+ * anything else (Rate, unknown properties) is just acknowledged so clients don't hang
+ * waiting for a reply. The new value is announced by the next mpris_tick(). */
+static void handle_set(DBusMessage *msg) {
+    DBusMessageIter it, var;
+    const char *iface = NULL, *prop = NULL;
+    if (dbus_message_iter_init(msg, &it) && dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_STRING) {
+        dbus_message_iter_get_basic(&it, &iface);
+        if (dbus_message_iter_next(&it) && dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_STRING) {
+            dbus_message_iter_get_basic(&it, &prop);
+            if (dbus_message_iter_next(&it) && dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_VARIANT
+                && iface && prop && !strcmp(iface, IFACE_PLAYER)) {
+                dbus_message_iter_recurse(&it, &var);
+                int t = dbus_message_iter_get_arg_type(&var);
+                if (!strcmp(prop, "Shuffle") && t == DBUS_TYPE_BOOLEAN) {
+                    dbus_bool_t b = FALSE;
+                    dbus_message_iter_get_basic(&var, &b);
+                    if (cbs.set_shuffle) cbs.set_shuffle(cbs.userdata, b ? true : false);
+                } else if (!strcmp(prop, "LoopStatus") && t == DBUS_TYPE_STRING) {
+                    const char *s = NULL;
+                    dbus_message_iter_get_basic(&var, &s);
+                    if (s && cbs.set_repeat) cbs.set_repeat(cbs.userdata, !strcmp(s, "Track"));
+                } else if (!strcmp(prop, "Volume") && t == DBUS_TYPE_DOUBLE) {
+                    double v = 1.0;
+                    dbus_message_iter_get_basic(&var, &v);
+                    if (cbs.set_volume && isfinite(v)) cbs.set_volume(cbs.userdata, v);
+                }
+            }
+        }
+    }
+    reply_empty(msg);
+}
 
 static void handle_player_method(DBusMessage *msg, const char *member) {
     if      (!strcmp(member, "Next"))     { if (cbs.next)       cbs.next(cbs.userdata);       reply_empty(msg); }
@@ -321,6 +404,8 @@ static const char *INTROSPECT_XML =
 "    <property name=\"Metadata\" type=\"a{sv}\" access=\"read\"/>\n"
 "    <property name=\"Volume\" type=\"d\" access=\"readwrite\"/>\n"
 "    <property name=\"Position\" type=\"x\" access=\"read\"/>\n"
+"    <property name=\"Shuffle\" type=\"b\" access=\"readwrite\"/>\n"
+"    <property name=\"LoopStatus\" type=\"s\" access=\"readwrite\"/>\n"
 "    <property name=\"MinimumRate\" type=\"d\" access=\"read\"/>\n"
 "    <property name=\"MaximumRate\" type=\"d\" access=\"read\"/>\n"
 "    <property name=\"CanGoNext\" type=\"b\" access=\"read\"/>\n"
@@ -366,8 +451,9 @@ static void handle_message(DBusMessage *msg) {
 
 /* ---------------- PropertiesChanged emission ---------------- */
 
-static void emit_properties_changed(bool track_changed, bool status_changed) {
-    if (!track_changed && !status_changed) return;
+static void emit_properties_changed(bool track_changed, bool status_changed, bool volume_changed,
+                                    bool shuffle_changed, bool loop_changed) {
+    if (!track_changed && !status_changed && !volume_changed && !shuffle_changed && !loop_changed) return;
     DBusMessage *sig = dbus_message_new_signal(OBJ_PATH, IFACE_PROPS, "PropertiesChanged");
     if (!sig) return;
 
@@ -379,6 +465,9 @@ static void emit_properties_changed(bool track_changed, bool status_changed) {
     dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "{sv}", &dict);
     if (status_changed) append_dict_sv_string(&dict, "PlaybackStatus", status_str(cur_state));
     if (track_changed)  append_metadata_prop(&dict);
+    if (volume_changed) append_dict_sv_double(&dict, "Volume", cur_volume < 0 ? 1.0 : (double)cur_volume);
+    if (shuffle_changed) append_dict_sv_bool(&dict, "Shuffle", cur_shuffle ? TRUE : FALSE);
+    if (loop_changed)   append_dict_sv_string(&dict, "LoopStatus", loop_str(cur_repeat));
     dbus_message_iter_close_container(&iter, &dict);
 
     dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "s", &empty_arr);
@@ -392,6 +481,7 @@ static void emit_properties_changed(bool track_changed, bool status_changed) {
 /* ---------------- public API ---------------- */
 
 int mpris_init(const mpris_callbacks_t *callbacks) {
+    if (getenv("LDMP_NO_MPRIS")) return -1;      /* debugging switch: don't register on D-Bus at all */
     if (callbacks) cbs = *callbacks;
     else memset(&cbs, 0, sizeof(cbs));
 
@@ -438,9 +528,8 @@ void mpris_shutdown(void) {
     have_bus = false;
 }
 
-void mpris_tick(const char *title, const char *artist, double duration_seconds,
-                 player_state_t state, float volume) {
-    if (!have_bus || !conn) return;
+void mpris_tick(const mpris_state_t *st) {
+    if (!have_bus || !conn || !st) return;
 
     dbus_connection_read_write(conn, 0);
     DBusMessage *msg;
@@ -449,31 +538,47 @@ void mpris_tick(const char *title, const char *artist, double duration_seconds,
         dbus_message_unref(msg);
     }
 
-    const char *t = title ? title : "";
-    const char *a = artist ? artist : "";
-    bool track_changed = (strcmp(t, cur_title) != 0 || strcmp(a, cur_artist) != 0);
+    char t[256], a[256];
+    to_valid_utf8(st->title ? st->title : "", t, sizeof(t));
+    to_valid_utf8(st->artist ? st->artist : "", a, sizeof(a));
+    const char *p = st->path ? st->path : "";
+    bool track_changed = (strcmp(t, cur_title) != 0 || strcmp(a, cur_artist) != 0 || strcmp(p, cur_path) != 0);
     if (track_changed) {
         track_serial++;
         snprintf(cur_trackid, sizeof(cur_trackid), "/org/ldmp/track/%ld", track_serial);
         snprintf(cur_title, sizeof(cur_title), "%s", t);
         snprintf(cur_artist, sizeof(cur_artist), "%s", a);
+        snprintf(cur_path, sizeof(cur_path), "%s", p);
+
+        /* where the file is, and its cover art (looked up once per track, not per tick) */
+        cur_url[0] = cur_art_url[0] = '\0';
+        if (p[0]) {
+            if (!cover_path_to_url(p, cur_url, sizeof(cur_url))) cur_url[0] = '\0';
+            char art[1024];
+            if (cover_find(p, art, sizeof(art)) && !cover_path_to_url(art, cur_art_url, sizeof(cur_art_url)))
+                cur_art_url[0] = '\0';
+        }
     }
-    cur_duration = duration_seconds;
+    cur_duration = st->duration_seconds;
 
-    bool status_changed = (state != cur_state);
-    cur_state = state;
-    cur_volume = volume;
+    bool status_changed = (st->state != cur_state);
+    cur_state = st->state;
+    cur_volume = st->volume;
+    bool volume_changed = fabsf(cur_volume - sent_volume) > 0.001f;
+    if (volume_changed) sent_volume = cur_volume;
 
-    emit_properties_changed(track_changed, status_changed);
+    bool shuffle_changed = (st->shuffle != cur_shuffle);
+    bool loop_changed = (st->repeat != cur_repeat);
+    cur_shuffle = st->shuffle;
+    cur_repeat = st->repeat;
+
+    emit_properties_changed(track_changed, status_changed, volume_changed, shuffle_changed, loop_changed);
 }
 
 #else /* !LDMP_MPRIS: built without libdbus - everything below is a no-op */
 
 int mpris_init(const mpris_callbacks_t *callbacks) { (void)callbacks; return -1; }
 void mpris_shutdown(void) {}
-void mpris_tick(const char *title, const char *artist, double duration_seconds,
-                 player_state_t state, float volume) {
-    (void)title; (void)artist; (void)duration_seconds; (void)state; (void)volume;
-}
+void mpris_tick(const mpris_state_t *state) { (void)state; }
 
 #endif
